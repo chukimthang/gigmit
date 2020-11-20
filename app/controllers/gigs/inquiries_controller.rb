@@ -1,10 +1,12 @@
+# app/controllers/gigs/inquiries_controller.rb
+
 class Gigs::InquiriesController < Gigs::ApplicationController
   load_and_authorize_resource # https://github.com/CanCanCommunity/cancancan#32-loaders
 
   respond_to :html, only: [:new, :show]
   respond_to :json, only: [:create]
 
-  before_filter :load_gig,       only: [:create, :new]
+  before_filter :load_gig, :load_technical_rider, :load_catering_rider, only: [:create, :new]
 
   def new
     @inquiry.gig                   = @gig
@@ -26,8 +28,8 @@ class Gigs::InquiriesController < Gigs::ApplicationController
     # if user keeps it until create, they will be copied async
     # otherwise he can pseudo delete the riders in the Inquiry#new form and
     # add new ones
-    @inquiry.technical_rider = current_profile.technical_rider
-    @inquiry.catering_rider  = current_profile.catering_rider
+    @inquiry.technical_rider = @technical_rider
+    @inquiry.catering_rider  = @catering_rider
 
     # Gigmit::Matcher#matches? returns a boolean whether an aritst matches a
     # given gig
@@ -35,12 +37,11 @@ class Gigs::InquiriesController < Gigs::ApplicationController
 
     if current_profile.billing_address.blank? || current_profile.tax_rate.blank?
       @profile = current_profile
+
       if @profile.billing_address.blank?
         @profile.build_billing_address
-        @profile.billing_address.name = [
-            @profile.main_user.first_name,
-            @profile.main_user.last_name
-        ].join(' ')
+        main_user = @profile.main_user
+        @profile.billing_address.name = main_user.try(:first_name) + " " + main_user.try(:last_name)
       end
     end
 
@@ -55,37 +56,25 @@ class Gigs::InquiriesController < Gigs::ApplicationController
     @inquiry.artist     = current_profile
     @inquiry.user       = current_profile.main_user
     @inquiry.promoter   = @gig.promoter
-    existing_gig_invite = current_profile.gig_invites.where(gig_id: params[:gig_id]).first
+    existing_gig_invite = current_profile.gig_invites.find_by_gig_id(params[:gig_id])
 
     #if inquiry is valid, which means we will definitivly after this, copy
     #the riders from the current profile to the inquiry
+
     if @inquiry.valid?
-      if current_profile.technical_rider.present? && current_profile.technical_rider.item_hash == params[:inquiry][:technical_rider_hash]
+      if @technical_rider.present? && @technical_rider.item_hash == params[:inquiry][:technical_rider_hash]
         @inquiry.build_technical_rider(user_id: current_user.id).save!
-        MediaItemWorker.perform_async(current_profile.technical_rider.id, @inquiry.technical_rider.id)
+        MediaItemWorker.perform_async(@technical_rider.id, @inquiry.technical_rider.id)
       end
 
-      if current_profile.catering_rider.present? && current_profile.catering_rider.item_hash == params[:inquiry][:catering_rider_hash]
+      if @catering_rider.present? && @catering_rider.item_hash == params[:inquiry][:catering_rider_hash]
         @inquiry.build_catering_rider(user_id: current_user.id).save!
-        MediaItemWorker.perform_async(current_profile.catering_rider.id, @inquiry.catering_rider.id)
+        MediaItemWorker.perform_async(@catering_rider.id, @inquiry.catering_rider.id)
       end
     end
 
     if @inquiry.save
-      #if profile has no rides yet, which means, this is the profiles first inquiry ever
-      #copy the riders from the inquiry to the profile
-      if current_profile.technical_rider.blank? && @inquiry.technical_rider.present?
-        current_profile.build_technical_rider(user_id: current_user.id).save!
-        MediaItemWorker.perform_async(@inquiry.technical_rider.id, current_profile.technical_rider.id)
-      end
-
-      if current_profile.catering_rider.blank? && @inquiry.catering_rider.present?
-        current_profile.build_catering_rider(user_id: current_user.id).save!
-        MediaItemWorker.perform_async(@inquiry.catering_rider.id, current_profile.catering_rider.id)
-      end
-
       Event::WatchlistArtistInquiry.emit(@inquiry.id)
-
       Gigmit::Intercom::Event::Simple.emit('gig-received-application', @gig.promoter_id)
       IntercomCreateOrUpdateUserWorker.perform_async(@gig.promoter_id)
 
@@ -110,7 +99,15 @@ class Gigs::InquiriesController < Gigs::ApplicationController
   private
 
   def load_gig
-    @gig = Gig.where(slug: params[:gig_id]).first
+    @gig = Gig.find_by_slug(params[:gig_id])
+  end
+
+  def load_technical_rider
+    @technical_rider = current_profile.technical_rider
+  end
+
+  def load_catering_rider
+    @catering_rider = current_profile.catering_rider
   end
 
   def paywall_chroot
